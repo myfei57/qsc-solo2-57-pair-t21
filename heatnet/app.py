@@ -4,12 +4,18 @@
 按真实调用链装到一起，并暴露四件事：操作编排（气象推送、调质调量、投运、调度、
 停运、拆分、定压改造）、控制循环、并发探测与状态快照。控制循环每个周期推进热源
 与二次网、把一次网跟随上去、落审计并采集趋势。
+
+控制台的动作接口不直接调这些编排方法，而是走 :attr:`Platform.intake` 受理台：
+同一标识只执行一次、状态不允许按动作策略当场拒绝或排队、长动作进度实时落审计。
+编排方法的 ``op_id`` / ``on_step`` 参数就是受理台把请求标识与进度回调接进来的
+通道；命令行直接调用时省略即可，行为与原来一致。
 """
 
 from __future__ import annotations
 
 import dataclasses
 import threading
+from typing import Callable
 
 from .audit.log import AuditLog
 from .audit.record import AuditRecord
@@ -18,6 +24,7 @@ from .config import PlatformConfig, default_config
 from .errors import PlantError
 from .eventbus import Event, EventBus
 from .ids import IdFactory
+from .intake.intake import Intake
 from .ns.registry import NamespaceRegistry
 from .ns.topology import Topology, build_default_topology
 from .ns.zone import Zone, ZoneRegistry
@@ -118,6 +125,8 @@ class Platform:
         self._lock = threading.RLock()
         self._register_namespaces()
         self._restore()
+        # 受理台最后装配：恢复落盘的受理记录时要用到上面的全部组件状态。
+        self.intake = Intake(self)
 
     # ---- 装配 ---------------------------------------------------------
 
@@ -210,11 +219,14 @@ class Platform:
             {"operations": self._operations, "cycles": self._cycles, "unit": self.unit},
         )
 
-    def _record_operation(self, op_id: str, operation: str, report: dict) -> dict:
-        """把编排步骤逐条写审计，并记一条汇总事件。"""
+    def _live_steps(self, op_id: str, on_step: Callable[[dict], None] | None) -> Callable[[dict], None]:
+        """构造执行中的步骤上报：实时落审计（与事后汇总同一格式），并转给调用方。
 
-        asset = str(report.get("asset", report.get("station", "")))
-        for step in report.get("steps", []):
+        步骤在编排推进过程中逐条发布，审计流水里的时间就是动作真实发生的时间；
+        受理台拿到同一个回调，控制台进度与审计流水因而是同一份数据。
+        """
+
+        def emit(step: dict) -> None:
             detail = dict(step.get("detail", {}))
             flat = {
                 key: value
@@ -226,12 +238,46 @@ class Platform:
                     step["component"],
                     step["component"],
                     step["action"],
-                    asset=asset,
+                    asset="",
                     op_id=op_id,
                     severity="notice",
                     **flat,
                 )
             )
+            if on_step is not None:
+                on_step(step)
+
+        return emit
+
+    def _record_operation(
+        self, op_id: str, operation: str, report: dict, steps_emitted: bool = False
+    ) -> dict:
+        """把编排步骤逐条写审计，并记一条汇总事件。
+
+        ``steps_emitted`` 为真时步骤已在执行中实时落过审计（见 :meth:`_live_steps`），
+        这里只补违规与汇总，不重复发步骤事件。
+        """
+
+        asset = str(report.get("asset", report.get("station", "")))
+        if not steps_emitted:
+            for step in report.get("steps", []):
+                detail = dict(step.get("detail", {}))
+                flat = {
+                    key: value
+                    for key, value in detail.items()
+                    if not isinstance(value, (dict, list))
+                }
+                self.bus.publish(
+                    Event.of(
+                        step["component"],
+                        step["component"],
+                        step["action"],
+                        asset=asset,
+                        op_id=op_id,
+                        severity="notice",
+                        **flat,
+                    )
+                )
         for violation in report.get("violations", []):
             self.bus.publish(
                 Event.of(
@@ -291,11 +337,19 @@ class Platform:
 
         return self.shutdown("planned-shutdown")
 
-    def startup(self, outdoor_c: float, demand_pct: float = 60.0, station: str = "console") -> dict:
+    def startup(
+        self,
+        outdoor_c: float,
+        demand_pct: float = 60.0,
+        station: str = "console",
+        *,
+        op_id: str | None = None,
+        on_step: Callable[[dict], None] | None = None,
+    ) -> dict:
         """按调度链顺序把平台从冷态带到带负荷。"""
 
         with self._lock:
-            op_id = self.ids.next()
+            op_id = op_id or self.ids.next()
             report = startup_plant(
                 self.source,
                 self.curve,
@@ -307,17 +361,24 @@ class Platform:
                 outdoor_c,
                 self.clock.now(),
                 demand_pct,
+                progress=self._live_steps(op_id, on_step),
             )
-            summary = self._record_operation(op_id, "startup", report)
+            summary = self._record_operation(op_id, "startup", report, steps_emitted=True)
             self._operations += 1
             self._persist()
             return {**report, **summary, "station": station}
 
-    def shutdown(self, reason: str = "planned-shutdown") -> dict:
+    def shutdown(
+        self,
+        reason: str = "planned-shutdown",
+        *,
+        op_id: str | None = None,
+        on_step: Callable[[dict], None] | None = None,
+    ) -> dict:
         """停运平台。"""
 
         with self._lock:
-            op_id = self.ids.next()
+            op_id = op_id or self.ids.next()
             report = shutdown_plant(
                 self.source,
                 self.network,
@@ -325,19 +386,20 @@ class Platform:
                 self.pump,
                 self.valves[sorted(self.valves)[0]],
                 reason,
+                progress=self._live_steps(op_id, on_step),
             )
-            summary = self._record_operation(op_id, "shutdown", report)
+            summary = self._record_operation(op_id, "shutdown", report, steps_emitted=True)
             self._operations += 1
             self._persist()
             return {**report, **summary}
 
     # ---- 操作编排 -----------------------------------------------------
 
-    def push_weather(self, outdoor_c: float, station: str = "console") -> dict:
+    def push_weather(self, outdoor_c: float, station: str = "console", *, op_id: str | None = None) -> dict:
         """接收一次气象推送并让热源按新曲线点火。"""
 
         with self._lock:
-            op_id = self.ids.next()
+            op_id = op_id or self.ids.next()
             report = push_weather(
                 self.source,
                 self.curve,
@@ -382,13 +444,16 @@ class Platform:
         target_c: float | None = None,
         zones: list[str] | None = None,
         cancel: CancelToken | None = None,
+        *,
+        op_id: str | None = None,
+        on_step: Callable[[dict], None] | None = None,
     ) -> dict:
         """按分区下发一次调度。"""
 
         with self._lock:
             selected = list(zones) if zones else self.zones.names()
             setpoint = self.config.station.setpoint_c if target_c is None else float(target_c)
-            op_id = self.ids.next()
+            op_id = op_id or self.ids.next()
             report = dispatch_demand(
                 self.service,
                 self.mapping,
@@ -398,8 +463,9 @@ class Platform:
                 demand_pct,
                 setpoint,
                 cancel,
+                progress=self._live_steps(op_id, on_step),
             )
-            summary = self._record_operation(op_id, "dispatch", report)
+            summary = self._record_operation(op_id, "dispatch", report, steps_emitted=True)
             self._operations += 1
             self._persist()
             return {**report, **summary}
@@ -438,19 +504,26 @@ class Platform:
             )
             return report
 
-    def secondary_cycle(self, dt: float = 1.0) -> dict:
+    def secondary_cycle(
+        self,
+        dt: float = 1.0,
+        *,
+        op_id: str | None = None,
+        on_step: Callable[[dict], None] | None = None,
+    ) -> dict:
         """跑一个二次网循环（结束前泵一定停稳）。"""
 
         with self._lock:
-            op_id = self.ids.next()
+            op_id = op_id or self.ids.next()
             report = run_cycle(
                 self.secondary,
                 self.pump,
                 self.valves[sorted(self.valves)[0]],
                 self.durable,
                 dt,
+                progress=self._live_steps(op_id, on_step),
             )
-            summary = self._record_operation(op_id, "secondary_cycle", report)
+            summary = self._record_operation(op_id, "secondary_cycle", report, steps_emitted=True)
             self._operations += 1
             self._persist()
             return {**report, **summary}
@@ -815,6 +888,7 @@ class Platform:
             "quota": self.quota_report(),
             "store": self.metrics.summary(),
             "audit": self.audit.summary(),
+            "intake": self.intake.summary(),
             "ids_issued": self.ids.issued(),
         }
 
@@ -854,6 +928,11 @@ class Platform:
         if not self.store.exists("platform_state"):
             return False
         return self.store.remove("platform_state")
+
+    def close(self) -> None:
+        """停止受理台后台执行线程（进程退出或测试收尾时调用）。"""
+
+        self.intake.shutdown()
 
 
 def build_platform(

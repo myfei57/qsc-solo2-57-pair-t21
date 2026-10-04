@@ -15,6 +15,8 @@ def test_api_returns_status_and_routes(platform):
     assert "/api/dispatch" in paths
     assert "/api/station/{name}" in paths
     assert "/api/zone/{name}" in paths
+    assert "/api/requests" in paths
+    assert "/api/request/{request_id}" in paths
 
 
 def test_api_unknown_path_and_station_are_404(platform):
@@ -23,6 +25,9 @@ def test_api_unknown_path_and_station_are_404(platform):
     assert status == 404
     assert payload["error"] == "not_found"
     status, payload = api.handle("GET", "/api/station/nope", {}, {})
+    assert status == 404
+    assert payload["error"] == "not_found"
+    status, payload = api.handle("GET", "/api/request/nope", {}, {})
     assert status == 404
     assert payload["error"] == "not_found"
 
@@ -53,14 +58,17 @@ def test_api_bad_request_and_interlock(platform):
     assert payload["component"] == "ns"
 
 
-def test_api_weather_adjust_and_readiness(platform):
+def test_api_weather_adjust_and_readiness(platform, wait_terminal):
     api = Api(platform)
-    status, weather = api.handle("POST", "/api/weather", {}, {"outdoor_c": -9.0})
-    assert status == 200
-    assert weather["ok"] is True
-    status, adjusted = api.handle("POST", "/api/adjust", {}, {"temperature_c": 88.0, "flow_t_h": 1500.0})
-    assert status == 200
-    assert adjusted["ok"] is True
+    status, accepted = api.handle("POST", "/api/weather", {}, {"outdoor_c": -9.0})
+    assert status == 202
+    weather = wait_terminal(platform, accepted["request"]["request_id"])
+    assert weather["status"] == "succeeded"
+    assert weather["result"]["ok"] is True
+    status, accepted = api.handle("POST", "/api/adjust", {}, {"temperature_c": 88.0, "flow_t_h": 1500.0})
+    assert status == 202
+    adjusted = wait_terminal(platform, accepted["request"]["request_id"])
+    assert adjusted["result"]["ok"] is True
     status, ready = api.handle("GET", "/api/readiness", {}, {})
     assert status == 200
     assert ready["checks"]["curve_fresh"] is True
@@ -98,39 +106,43 @@ def test_api_timeline_journal_and_store(platform):
     assert isinstance(store["documents"], list)
 
 
-def test_api_actions_cover_queue_and_meter(platform):
-    api = Api(platform)
-    status, queued = api.handle("POST", "/api/dispatch", {}, {"demand_pct": 55.0, "zones": ["north"]})
-    assert status == 200
-    assert queued["ok"] is True
-    status, meter = api.handle("POST", "/api/meter", {}, {"meter": "st01.heat-meter", "delta_mwh": 4.0})
-    assert status == 200
-    assert meter["total_mwh"] > 0.0
-    status, settled = api.handle("POST", "/api/settle", {}, {})
-    assert status == 200
-    assert settled["period"] == 1
-    status, pump = api.handle("POST", "/api/pump", {}, {"action": "start", "speed_pct": 70.0})
-    assert status == 200
-    assert pump["running"] is True
-    status, stopped = api.handle("POST", "/api/pump", {}, {"action": "stop"})
-    assert status == 200
-    assert stopped["running"] is False
-    status, disturbed = api.handle("POST", "/api/disturb", {}, {"heat_fraction": 0.2})
-    assert status == 200
-    assert disturbed["disturbances"] == 1
+def test_api_actions_cover_queue_and_meter(online, wait_terminal):
+    api = Api(online)
+    status, accepted = api.handle("POST", "/api/dispatch", {}, {"demand_pct": 55.0, "zones": ["north"]})
+    assert status == 202
+    dispatched = wait_terminal(online, accepted["request"]["request_id"])
+    assert dispatched["status"] == "succeeded"
+    assert dispatched["result"]["ok"] is True
+    status, accepted = api.handle("POST", "/api/meter", {}, {"meter": "st01.heat-meter", "delta_mwh": 4.0})
+    assert status == 202
+    meter = wait_terminal(online, accepted["request"]["request_id"])
+    assert meter["result"]["total_mwh"] > 0.0
+    status, accepted = api.handle("POST", "/api/settle", {}, {})
+    settled = wait_terminal(online, accepted["request"]["request_id"])
+    assert settled["result"]["period"] == 1
+    status, accepted = api.handle("POST", "/api/pump", {}, {"action": "start", "speed_pct": 70.0})
+    pump = wait_terminal(online, accepted["request"]["request_id"])
+    assert pump["result"]["running"] is True
+    status, accepted = api.handle("POST", "/api/pump", {}, {"action": "stop"})
+    stopped = wait_terminal(online, accepted["request"]["request_id"])
+    assert stopped["result"]["running"] is False
+    status, accepted = api.handle("POST", "/api/disturb", {}, {"heat_fraction": 0.2})
+    disturbed = wait_terminal(online, accepted["request"]["request_id"])
+    assert disturbed["result"]["disturbances"] == 1
 
 
-def test_api_concurrency_trip_and_reset(platform):
+def test_api_concurrency_trip_and_reset(platform, wait_terminal):
     api = Api(platform)
-    status, concurrency = api.handle("POST", "/api/concurrency", {}, {"rounds": 12})
-    assert status == 200
-    assert concurrency["ok"] is True
-    status, trip = api.handle("POST", "/api/trip", {}, {"reason": "console"})
-    assert status == 200
-    assert trip["state"] == "tripped"
-    status, reset = api.handle("POST", "/api/reset", {}, {"operator": "console"})
-    assert status == 200
-    assert reset["state"] == "idle"
+    status, accepted = api.handle("POST", "/api/concurrency", {}, {"rounds": 12})
+    assert status == 202
+    concurrency = wait_terminal(platform, accepted["request"]["request_id"])
+    assert concurrency["result"]["ok"] is True
+    status, accepted = api.handle("POST", "/api/trip", {}, {"reason": "console"})
+    trip = wait_terminal(platform, accepted["request"]["request_id"])
+    assert trip["result"]["state"] == "tripped"
+    status, accepted = api.handle("POST", "/api/reset", {}, {"operator": "console"})
+    reset = wait_terminal(platform, accepted["request"]["request_id"])
+    assert reset["result"]["state"] == "idle"
 
 
 def test_server_serves_api_over_http(platform):

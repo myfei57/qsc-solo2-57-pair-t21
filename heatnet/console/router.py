@@ -9,7 +9,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Callable
 
-Handler = Callable[[dict, dict], dict]
+# 查询类处理器返回响应体（状态码固定 200）；动作类处理器返回 ``(状态码, 响应体)``，
+# 由受理结果决定是 202、200 还是 409。
+Handler = Callable[[dict, dict], "dict | tuple[int, dict]"]
 
 
 @dataclass(frozen=True)

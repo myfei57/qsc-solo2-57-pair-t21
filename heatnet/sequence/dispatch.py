@@ -2,9 +2,13 @@
 
 调度把目标负荷折算成各站的开度需求，按分区优先级排出计划，交给一次网按站独立
 分配流量，再逐区下发。流量基线可以按实测重新标定，标定之后联锁门限同步变化。
+
+``progress`` 回调把流量分配与逐站调节的步骤实时报给受理台。
 """
 
 from __future__ import annotations
+
+from typing import Callable
 
 from ..ns.zone import ZoneRegistry
 from ..primary.network import PrimaryNetwork
@@ -23,11 +27,12 @@ def dispatch_demand(
     target_c: float,
     cancel: CancelToken | None = None,
     dt: float = 1.0,
+    progress: Callable[[dict], None] | None = None,
 ) -> dict:
     """按分区下发一次调度。"""
 
     report = run_batch(
-        service, mapping, zones, network, zone_names, demand_pct, target_c, cancel, dt
+        service, mapping, zones, network, zone_names, demand_pct, target_c, cancel, dt, progress
     )
     return {
         **report,

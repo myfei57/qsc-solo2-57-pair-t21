@@ -2,10 +2,13 @@
 
 批量调节按分区逐站下发，每处理一个站之前都要重新看一次取消信号：只在循环开始
 前看一次、或者在循环之后补一次，客户端超时取消之后剩下的站照样会被改掉，现场
-看到的是"取消之后还有几个站的阀位变了"。
+看到的是"取消之后还有几个站的阀位变了"。每调完一站就通过 ``progress`` 上报一步，
+受理台能实时看到下发推进到哪个站。
 """
 
 from __future__ import annotations
+
+from typing import Callable
 
 from ..store.state import DurableState
 from ..valve.valve import Valve
@@ -94,8 +97,9 @@ class StationService:
         target_c: float,
         cancel: CancelToken | None = None,
         dt: float = 1.0,
+        progress: Callable[[dict], None] | None = None,
     ) -> dict:
-        """调节一个分区里的全部换热站，每一步都检查取消信号。"""
+        """调节一个分区里的全部换热站，每一步都检查取消信号并上报进度。"""
 
         if dt <= 0:
             raise ValueError("步长必须为正")
@@ -119,7 +123,10 @@ class StationService:
             detail = apply_mix(station, valve, self._durable, target_c, dt)
             self._durable.save(f"station/{station_name}", {"zone": zone_name, "target_c": target_c})
             adjusted.append(station_name)
-            steps.append({"component": "station", "action": "adjust", "detail": detail})
+            step = {"component": "station", "action": "adjust", "detail": detail}
+            steps.append(step)
+            if progress is not None:
+                progress(step)
         return {
             "ok": True,
             "zone": zone_name,

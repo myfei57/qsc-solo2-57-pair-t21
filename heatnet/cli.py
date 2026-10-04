@@ -53,18 +53,20 @@ def _cmd_serve(args: argparse.Namespace) -> int:
     if args.probe:
         payload["probe"] = probe_endpoints(base_url, list(DEFAULT_PROBE_PATHS))
     _dump(payload)
-    if args.duration > 0:
-        try:
-            time.sleep(args.duration)
-        except KeyboardInterrupt:  # pragma: no cover - 交互路径
-            pass
-        server.stop()
-        return 0
     try:
+        if args.duration > 0:
+            try:
+                time.sleep(args.duration)
+            except KeyboardInterrupt:  # pragma: no cover - 交互路径
+                pass
+            return 0
         while True:
             time.sleep(1.0)
     except KeyboardInterrupt:  # pragma: no cover - 交互路径
+        pass
+    finally:
         server.stop()
+        platform.close()
     return 0
 
 
@@ -132,6 +134,7 @@ def _cmd_demo(args: argparse.Namespace) -> int:
         "status": platform.status(),
     }
     _dump(report)
+    platform.close()
 
     failures = [name for name, item in probe.items() if not item["ok"]]
     for name, operation in (

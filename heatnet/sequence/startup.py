@@ -3,9 +3,14 @@
 气象推送必须先更新曲线，热源再按新曲线调质；调质确认之后才允许调量，调量完成
 一次网才跟随；随后按"先补后定"把压力拉回目标带，最后跑一个循环建立流量。任何
 一步失败都停在原地，不带着半截状态继续往下走。
+
+``progress`` 回调把每个阶段的步骤实时报给受理台：投运跑到哪一步、卡在哪一步，
+控制台与审计看到的时间线是同一条。
 """
 
 from __future__ import annotations
+
+from typing import Callable
 
 from ..errors import PlantError
 from ..primary.network import PrimaryNetwork
@@ -34,14 +39,25 @@ def startup_plant(
     now: float,
     demand_pct: float = 60.0,
     dt: float = 1.0,
+    progress: Callable[[dict], None] | None = None,
 ) -> dict:
     """把整条调度链从冷态带到带负荷。"""
 
     steps: list[dict] = []
     violations: list[str] = []
 
+    def emit(step: dict) -> None:
+        steps.append(step)
+        if progress is not None:
+            progress(step)
+
+    def absorb(sub_steps: list[dict]) -> None:
+        # 子编排（气象、补水）的步骤在此刻才拿到，逐条并入并上报。
+        for step in sub_steps:
+            emit(step)
+
     weather = push_weather(source, curve, WeatherPush(outdoor_c, now), now)
-    steps.extend(weather["steps"])
+    absorb(weather["steps"])
     violations.extend(weather["violations"])
     if not weather["ok"]:
         return {"ok": False, "steps": steps, "violations": violations, "stage": "weather"}
@@ -50,7 +66,7 @@ def startup_plant(
         source.settle_quality(curve.supply_c(), dt)
         if source.quality_confirmed():
             break
-    steps.append(
+    emit(
         {
             "component": "source",
             "action": "confirm_quality",
@@ -74,7 +90,7 @@ def startup_plant(
     network.set_supply(source.temperature_c())
     network.set_return(loop.return_c())
     network.set_flow(source.flow_t_h())
-    steps.append(
+    emit(
         {
             "component": "primary",
             "action": "follow_source",
@@ -83,12 +99,13 @@ def startup_plant(
     )
 
     makeup = makeup_then_pressurise(loop, dt)
-    steps.extend(makeup["steps"])
+    absorb(makeup["steps"])
     violations.extend(makeup["violations"])
     if not makeup["ok"]:
         return {"ok": False, "steps": steps, "violations": violations, "stage": "makeup"}
 
-    cycle = run_cycle(loop, pump, valve, durable, dt)
+    cycle = run_cycle(loop, pump, valve, durable, dt, progress=progress)
+    # run_cycle 已把步骤实时报给 progress，这里只并入清单，不重复上报。
     steps.extend(cycle["steps"])
     violations.extend(cycle["violations"])
     if not cycle["ok"]:

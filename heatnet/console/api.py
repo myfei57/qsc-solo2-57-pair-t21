@@ -1,8 +1,11 @@
 """控制台接口处理器。
 
-每个接口都是对平台公开方法的一次调用；动作类接口把请求体里的参数透传给平台，
-缺少必填字段或取值非法时返回 ``400``，平台联锁异常统一转成 ``409`` 并在响应里
-带上组件名与原因。
+查询类接口直接读平台快照。动作类接口统一走受理台（``platform.intake``）：
+每次提交带 ``request_id``（请求体或查询串，缺省时服务端生成），同一标识只执行
+一次；受理结果定死为三种——``202`` 已受理（待执行或排队等状态满足）、``200``
+同一标识的重复提交（返回既有记录与当前进度）、``409`` 门控当场拒绝或标识冲突。
+进度与结果用 ``GET /api/request/{request_id}`` 查询，拒绝理由、进度与审计流水
+同源。参数缺失或取值非法仍当场返回 ``400``，平台联锁异常统一转成 ``409``。
 """
 
 from __future__ import annotations
@@ -10,7 +13,6 @@ from __future__ import annotations
 from ..app import Platform
 from ..audit.timeline import build_timeline
 from ..errors import PlantError
-from ..station.service import CancelToken
 from .router import Router
 
 
@@ -20,6 +22,15 @@ def _as_float(body: dict, key: str, default: float) -> float:
         return float(value)
     except (TypeError, ValueError) as error:
         raise PlantError(f"参数 {key!r} 必须是数值", component="console") from error
+
+
+def _request_id(params: dict, body: dict) -> str | None:
+    """取客户端幂等标识：请求体优先，查询串次之；都没有则由受理台生成。"""
+
+    value = body.get("request_id") or params.get("request_id")
+    if value is None or str(value).strip() == "":
+        return None
+    return str(value)
 
 
 class Api:
@@ -58,6 +69,8 @@ class Api:
         add("GET", "/api/journal", self._journal)
         add("GET", "/api/store", self._store)
         add("GET", "/api/readiness", self._readiness)
+        add("GET", "/api/requests", self._requests)
+        add("GET", "/api/request/{request_id}", self._request)
         add("POST", "/api/weather", self._weather)
         add("POST", "/api/adjust", self._adjust)
         add("POST", "/api/startup", self._startup)
@@ -76,7 +89,7 @@ class Api:
         add("POST", "/api/trip", self._trip)
         add("POST", "/api/reset", self._reset)
         add("POST", "/api/concurrency", self._concurrency)
-        add("POST", "/api/plant/reset-state", lambda params, body: {"removed": self._platform.reset_state()})
+        add("POST", "/api/plant/reset-state", self._reset_state)
 
     def routes(self) -> list[dict]:
         """返回接口清单，供自检与文档核对。"""
@@ -100,6 +113,8 @@ class Api:
             return 404, {"error": "not_found", "message": str(error)}
         except (TypeError, ValueError) as error:
             return 400, {"error": "bad_request", "message": str(error)}
+        if isinstance(payload, tuple):
+            return payload
         return 200, payload
 
     # ---- 查询 ---------------------------------------------------------
@@ -248,93 +263,163 @@ class Api:
         }
         return {"ready": all(checks.values()), "checks": checks, "info": info}
 
+    def _requests(self, params: dict, body: dict) -> dict:
+        return {
+            "requests": self._platform.intake.list_requests(
+                limit=int(params.get("limit", 50)),
+                action=params.get("action") or None,
+                status=params.get("status") or None,
+            )
+        }
+
+    def _request(self, params: dict, body: dict) -> dict:
+        return {"request": self._platform.intake.get(params.get("request_id", ""))}
+
     # ---- 动作 ---------------------------------------------------------
 
-    def _weather(self, params: dict, body: dict) -> dict:
-        return self._platform.push_weather(
-            _as_float(body, "outdoor_c", 0.0), str(body.get("station", "console"))
+    def _submit(self, action: str, params: dict, body: dict, query: dict) -> tuple[int, dict]:
+        """把一次动作提交给受理台，返回 ``(状态码, 响应体)``。"""
+
+        return self._platform.intake.submit(action, params, request_id=_request_id(query, body))
+
+    def _weather(self, params: dict, body: dict) -> tuple[int, dict]:
+        return self._submit(
+            "weather",
+            {
+                "outdoor_c": _as_float(body, "outdoor_c", 0.0),
+                "station": str(body.get("station", "console")),
+            },
+            body,
+            params,
         )
 
-    def _adjust(self, params: dict, body: dict) -> dict:
-        return self._platform.adjust_source(
-            _as_float(body, "temperature_c", self._platform.source.temperature_c()),
-            _as_float(body, "flow_t_h", self._platform.network.baseline_t_h()),
-            str(body.get("origin", "console")),
+    def _adjust(self, params: dict, body: dict) -> tuple[int, dict]:
+        return self._submit(
+            "adjust",
+            {
+                "temperature_c": _as_float(body, "temperature_c", self._platform.source.temperature_c()),
+                "flow_t_h": _as_float(body, "flow_t_h", self._platform.network.baseline_t_h()),
+                "origin": str(body.get("origin", "console")),
+            },
+            body,
+            params,
         )
 
-    def _startup(self, params: dict, body: dict) -> dict:
-        return self._platform.startup(
-            _as_float(body, "outdoor_c", 0.0),
-            _as_float(body, "demand_pct", 60.0),
-            str(body.get("station", "console")),
+    def _startup(self, params: dict, body: dict) -> tuple[int, dict]:
+        return self._submit(
+            "startup",
+            {
+                "outdoor_c": _as_float(body, "outdoor_c", 0.0),
+                "demand_pct": _as_float(body, "demand_pct", 60.0),
+                "station": str(body.get("station", "console")),
+            },
+            body,
+            params,
         )
 
-    def _shutdown(self, params: dict, body: dict) -> dict:
-        return self._platform.shutdown(str(body.get("reason", "console-shutdown")))
+    def _shutdown(self, params: dict, body: dict) -> tuple[int, dict]:
+        return self._submit(
+            "shutdown", {"reason": str(body.get("reason", "console-shutdown"))}, body, params
+        )
 
-    def _dispatch(self, params: dict, body: dict) -> dict:
+    def _dispatch(self, params: dict, body: dict) -> tuple[int, dict]:
         zones = body.get("zones")
-        selected = None if not zones else [str(item) for item in zones]
-        cancel = CancelToken(str(body.get("cancel_reason", "console-cancel"))) if body.get("cancel") else None
-        return self._platform.dispatch(
-            _as_float(body, "demand_pct", 60.0),
-            _as_float(body, "target_c", self._platform.config.station.setpoint_c),
-            selected,
-            cancel,
+        return self._submit(
+            "dispatch",
+            {
+                "demand_pct": _as_float(body, "demand_pct", 60.0),
+                "target_c": _as_float(body, "target_c", self._platform.config.station.setpoint_c),
+                "zones": None if not zones else [str(item) for item in zones],
+                "cancel": bool(body.get("cancel")),
+                "cancel_reason": str(body.get("cancel_reason", "console-cancel")),
+            },
+            body,
+            params,
         )
 
-    def _cycle(self, params: dict, body: dict) -> dict:
-        return self._platform.cycle(_as_float(body, "dt", 1.0))
+    def _cycle(self, params: dict, body: dict) -> tuple[int, dict]:
+        return self._submit("cycle", {"dt": _as_float(body, "dt", 1.0)}, body, params)
 
-    def _calibrate(self, params: dict, body: dict) -> dict:
-        measured = _as_float(body, "measured_t_h", self._platform.network.baseline_t_h())
-        return self._platform.calibrate_flow(measured)
-
-    def _retrofit(self, params: dict, body: dict) -> dict:
-        target = _as_float(body, "baseline_kpa", self._platform.pressure.baseline.value_kpa())
-        return self._platform.retrofit_baseline(target)
-
-    def _secondary_cycle(self, params: dict, body: dict) -> dict:
-        return self._platform.secondary_cycle(_as_float(body, "dt", 1.0))
-
-    def _meter(self, params: dict, body: dict) -> dict:
-        return self._platform.collect_heat(
-            str(body.get("meter", self._platform.meter_names()[0])),
-            _as_float(body, "delta_mwh", 1.0),
+    def _calibrate(self, params: dict, body: dict) -> tuple[int, dict]:
+        return self._submit(
+            "calibrate",
+            {"measured_t_h": _as_float(body, "measured_t_h", self._platform.network.baseline_t_h())},
+            body,
+            params,
         )
 
-    def _settle(self, params: dict, body: dict) -> dict:
-        return self._platform.settle_quota()
+    def _retrofit(self, params: dict, body: dict) -> tuple[int, dict]:
+        return self._submit(
+            "retrofit",
+            {"baseline_kpa": _as_float(body, "baseline_kpa", self._platform.pressure.baseline.value_kpa())},
+            body,
+            params,
+        )
 
-    def _split(self, params: dict, body: dict) -> dict:
+    def _secondary_cycle(self, params: dict, body: dict) -> tuple[int, dict]:
+        return self._submit("secondary_cycle", {"dt": _as_float(body, "dt", 1.0)}, body, params)
+
+    def _meter(self, params: dict, body: dict) -> tuple[int, dict]:
+        return self._submit(
+            "meter",
+            {
+                "meter": str(body.get("meter", self._platform.meter_names()[0])),
+                "delta_mwh": _as_float(body, "delta_mwh", 1.0),
+            },
+            body,
+            params,
+        )
+
+    def _settle(self, params: dict, body: dict) -> tuple[int, dict]:
+        return self._submit("settle", {}, body, params)
+
+    def _split(self, params: dict, body: dict) -> tuple[int, dict]:
         stations = body.get("stations") or []
-        return self._platform.split_zone(
-            str(body.get("source_zone", "")),
-            [str(item) for item in stations],
-            str(body.get("new_zone", "")),
+        return self._submit(
+            "split",
+            {
+                "source_zone": str(body.get("source_zone", "")),
+                "stations": [str(item) for item in stations],
+                "new_zone": str(body.get("new_zone", "")),
+            },
+            body,
+            params,
         )
 
-    def _replay(self, params: dict, body: dict) -> dict:
+    def _replay(self, params: dict, body: dict) -> tuple[int, dict]:
         stations = body.get("stations")
-        selected = None if not stations else [str(item) for item in stations]
-        return self._platform.replay_valves(selected)
+        return self._submit(
+            "replay",
+            {"stations": None if not stations else [str(item) for item in stations]},
+            body,
+            params,
+        )
 
-    def _pump(self, params: dict, body: dict) -> dict:
-        action = str(body.get("action", "cycle"))
-        if action == "start":
-            return self._platform.start_pump(_as_float(body, "speed_pct", 85.0))
-        if action == "stop":
-            return self._platform.stop_pump()
-        return self._platform.secondary_cycle(_as_float(body, "dt", 1.0))
+    def _pump(self, params: dict, body: dict) -> tuple[int, dict]:
+        return self._submit(
+            "pump",
+            {
+                "pump_action": str(body.get("action", "cycle")),
+                "speed_pct": _as_float(body, "speed_pct", 85.0),
+                "dt": _as_float(body, "dt", 1.0),
+            },
+            body,
+            params,
+        )
 
-    def _disturb(self, params: dict, body: dict) -> dict:
-        return self._platform.disturb_secondary(_as_float(body, "heat_fraction", 0.5))
+    def _disturb(self, params: dict, body: dict) -> tuple[int, dict]:
+        return self._submit(
+            "disturb", {"heat_fraction": _as_float(body, "heat_fraction", 0.5)}, body, params
+        )
 
-    def _trip(self, params: dict, body: dict) -> dict:
-        return self._platform.trip(str(body.get("reason", "overtemperature")))
+    def _trip(self, params: dict, body: dict) -> tuple[int, dict]:
+        return self._submit("trip", {"reason": str(body.get("reason", "overtemperature"))}, body, params)
 
-    def _reset(self, params: dict, body: dict) -> dict:
-        return self._platform.reset_source(str(body.get("operator", "shift-lead")))
+    def _reset(self, params: dict, body: dict) -> tuple[int, dict]:
+        return self._submit("reset", {"operator": str(body.get("operator", "shift-lead"))}, body, params)
 
-    def _concurrency(self, params: dict, body: dict) -> dict:
-        return self._platform.concurrency_probe(rounds=int(body.get("rounds", 24)))
+    def _concurrency(self, params: dict, body: dict) -> tuple[int, dict]:
+        return self._submit("concurrency", {"rounds": int(body.get("rounds", 24))}, body, params)
+
+    def _reset_state(self, params: dict, body: dict) -> tuple[int, dict]:
+        return self._submit("reset_state", {}, body, params)

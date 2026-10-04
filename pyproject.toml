@@ -27,4 +27,5 @@ packages = [
     "heatnet.quota",
     "heatnet.sequence",
     "heatnet.console",
+    "heatnet.intake",
 ]

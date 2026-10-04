@@ -3,9 +3,13 @@
 先按分区优先级排出下发顺序并算出计划，再交给一次网按站独立分配流量，最后逐区
 调节。流量分配与阀门动作分两步做，是为了让"计划里的流量"与"执行后的阀位"可以
 分别核对。
+
+``progress`` 回调把流量分配与逐站调节的步骤实时报给受理台。
 """
 
 from __future__ import annotations
+
+from typing import Callable
 
 from ..primary.flow import StationFlow, batch_flows
 from ..primary.network import PrimaryNetwork
@@ -44,6 +48,7 @@ def run_batch(
     target_c: float,
     cancel: CancelToken | None = None,
     dt: float = 1.0,
+    progress: Callable[[dict], None] | None = None,
 ) -> dict:
     """算流量、下发分区、汇总结果。"""
 
@@ -51,13 +56,20 @@ def run_batch(
     flows: list[StationFlow] = batch_flows(network, plan)
     ordered = [name for name, _ in priority_order([(n, zones.get(n).setpoint_c) for n in zone_names])]
     network.count_dispatch()
-    steps: list[dict] = [
-        {"component": "primary", "action": "allocate_flow", "detail": flow.as_dict()} for flow in flows
-    ]
+    steps: list[dict] = []
+
+    def emit(step: dict) -> None:
+        steps.append(step)
+        if progress is not None:
+            progress(step)
+
+    for flow in flows:
+        emit({"component": "primary", "action": "allocate_flow", "detail": flow.as_dict()})
     violations: list[str] = []
     adjusted: list[str] = []
     for zone_name in ordered:
-        report = service.adjust_zone(mapping, zone_name, target_c, cancel, dt)
+        report = service.adjust_zone(mapping, zone_name, target_c, cancel, dt, progress=progress)
+        # adjust_zone 已把逐站步骤实时报给 progress，这里只并入清单，不重复上报。
         steps.extend(report["steps"])
         violations.extend(report["violations"])
         adjusted.extend(report["adjusted"])
