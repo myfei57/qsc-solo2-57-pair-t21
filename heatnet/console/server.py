@@ -43,8 +43,10 @@ class _Handler(BaseHTTPRequestHandler):
         if not isinstance(body, dict):
             body = {}
         query = {key: values[-1] for key, values in parse_qs(parsed.query).items()}
+        # 幂等键走 X-Request-Id 头；头部名大小写不敏感，统一成小写交给 API。
+        headers = {key.lower(): value for key, value in self.headers.items()}
 
-        status, payload = self.server.api.handle(method, parsed.path, query, body)  # type: ignore[attr-defined]
+        status, payload = self.server.api.handle(method, parsed.path, query, body, headers)  # type: ignore[attr-defined]
         self._respond(
             status,
             json.dumps(payload, ensure_ascii=False, default=str).encode("utf-8"),
@@ -114,7 +116,7 @@ class ConsoleServer:
         return f"http://{host}:{self.port}"
 
     def stop(self) -> None:
-        """停止服务。"""
+        """停止服务，并停掉平台后台命令 worker。"""
 
         if self._server is None:
             return
@@ -124,6 +126,7 @@ class ConsoleServer:
             self._thread.join(timeout=5)
         self._server = None
         self._thread = None
+        self._platform.commands.stop()
 
 
 def probe_endpoints(base_url: str, paths: list[str]) -> dict:

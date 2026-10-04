@@ -7,12 +7,17 @@
 
 from __future__ import annotations
 
+from typing import Callable
+
 from ..pump.pump import Pump
 from ..store.state import DurableState
 from ..valve.valve import Valve
 from .loop import SecondaryLoop
 
 MAX_STEPS = 600
+
+# 进度回调：(阶段, 已完成步数, 预估总步, 当前迭代, 现场读数)
+ProgressCallback = Callable[[str, int, int, int, dict], None]
 
 
 def run_cycle(
@@ -22,11 +27,17 @@ def run_cycle(
     durable: DurableState,
     dt: float = 1.0,
     speed_pct: float = 85.0,
+    on_progress: ProgressCallback | None = None,
 ) -> dict:
     """跑完一个二次网循环，并保证泵在返回前停稳。"""
 
     if dt <= 0:
         raise ValueError("步长必须为正")
+
+    def report(stage: str, tick: int, detail: dict) -> None:
+        if on_progress is not None:
+            # 预热升速 + 收尾停泵两段，取升速段做百分比，预估上限 MAX_STEPS。
+            on_progress(stage, 0, MAX_STEPS, tick, detail)
 
     def circulate() -> dict:
         steps: list[dict] = []
@@ -41,10 +52,20 @@ def run_cycle(
                 "detail": {"target_flow_t_h": round(pump.target_flow_t_h(), 2)},
             }
         )
+        report("pump_start", 0, {"target_flow_t_h": round(pump.target_flow_t_h(), 2)})
         pump.set_speed(speed_pct)
-        for _ in range(MAX_STEPS):
+        for tick in range(MAX_STEPS):
             flow = pump.step(dt)
             last = loop.step(dt, flow)
+            if tick % 20 == 0 or last["overheat"]:
+                report(
+                    "circulate",
+                    tick,
+                    {
+                        "flow_t_h": round(flow, 2),
+                        "return_c": round(loop.return_c(), 2),
+                    },
+                )
             if last["overheat"]:
                 violations.append("return_overtemperature")
                 steps.append(
@@ -57,7 +78,18 @@ def run_cycle(
                         },
                     }
                 )
-                return {"ok": False, "steps": steps, "violations": violations, "flow_t_h": round(flow, 2)}
+                report(
+                    "abort_overtemperature",
+                    tick,
+                    {"return_c": round(loop.return_c(), 2), "ceiling_c": round(loop.return_ceiling_c(), 2)},
+                )
+                return {
+                    "ok": False,
+                    "steps": steps,
+                    "violations": violations,
+                    "stage": "abort_overtemperature",
+                    "flow_t_h": round(flow, 2),
+                }
             if pump.target_flow_t_h() > 0 and abs(pump.flow_t_h() - pump.target_flow_t_h()) < 1e-6:
                 break
         steps.append(
@@ -66,6 +98,11 @@ def run_cycle(
                 "action": "settle",
                 "detail": {"flow_t_h": round(pump.flow_t_h(), 2), "return_c": round(loop.return_c(), 2)},
             }
+        )
+        report(
+            "settle",
+            MAX_STEPS,
+            {"flow_t_h": round(pump.flow_t_h(), 2), "return_c": round(loop.return_c(), 2)},
         )
         valve.set_target(valve.position_pct())
         return {
@@ -80,10 +117,13 @@ def run_cycle(
         outcome = circulate()
     finally:
         pump.stop()
-        for _ in range(MAX_STEPS):
+        for tick in range(MAX_STEPS):
             pump.step(dt)
+            if tick % 20 == 0:
+                report("pump_coasting_down", tick, {"flow_t_h": round(pump.flow_t_h(), 2)})
             if pump.idle():
                 break
+        report("pump_idle", MAX_STEPS, {"flow_t_h": round(pump.flow_t_h(), 2)})
         durable.save(
             f"secondary/{loop.limits.makeup_target_kpa:.0f}",
             {"running": False, "flow_t_h": round(pump.flow_t_h(), 4)},

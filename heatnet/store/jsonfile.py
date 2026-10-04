@@ -65,6 +65,45 @@ class JsonStore:
                 raise StorageError(f"写入文档 {doc_id} 失败: {error}", component="store") from error
         return target
 
+    def create_if_absent(self, doc_id: str, payload: Any) -> tuple[bool, str]:
+        """原子地"文档不存在才创建"。
+
+        成功写入返回 ``(True, 路径)``；文档已存在（包括并发期间被别的线程/进程
+        抢先创建）返回 ``(False, 路径)``，不覆盖原文档。幂等登记靠这一个原语
+        兜底：内存里的去重判断可能被并发同时通过，落盘这一步只有一方能成功。
+        """
+
+        target = self.path_of(doc_id)
+        directory = os.path.dirname(target)
+        with self._lock:
+            if os.path.exists(target):
+                return False, target
+            try:
+                os.makedirs(directory, exist_ok=True)
+                handle = tempfile.NamedTemporaryFile(
+                    "w",
+                    encoding="utf-8",
+                    dir=directory,
+                    prefix=".write.",
+                    suffix=".tmp",
+                    delete=False,
+                )
+                with handle:
+                    json.dump(payload, handle, ensure_ascii=False, indent=2)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                # O_NOFOLLOW 之外，用 link 而不是 replace：目标已存在时 link 失败，
+                # 不会把抢先创建的文档顶掉。
+                try:
+                    os.link(handle.name, target)
+                except FileExistsError:
+                    os.unlink(handle.name)
+                    return False, target
+                os.unlink(handle.name)
+            except OSError as error:
+                raise StorageError(f"创建文档 {doc_id} 失败: {error}", component="store") from error
+        return True, target
+
     def read(self, doc_id: str) -> Any | None:
         """读取一个文档，不存在时返回 ``None``。"""
 

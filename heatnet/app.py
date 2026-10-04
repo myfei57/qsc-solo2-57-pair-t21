@@ -14,6 +14,7 @@ import threading
 from .audit.log import AuditLog
 from .audit.record import AuditRecord
 from .clock import Clock, SystemClock
+from .command.center import CommandCenter
 from .config import PlatformConfig, default_config
 from .errors import PlantError
 from .eventbus import Event, EventBus
@@ -118,6 +119,8 @@ class Platform:
         self._lock = threading.RLock()
         self._register_namespaces()
         self._restore()
+        # 命令中心必须最后装配：它启动 worker 前要能看到恢复完成的现场。
+        self.commands = CommandCenter(self, store, self.clock)
 
     # ---- 装配 ---------------------------------------------------------
 
@@ -291,7 +294,18 @@ class Platform:
 
         return self.shutdown("planned-shutdown")
 
-    def startup(self, outdoor_c: float, demand_pct: float = 60.0, station: str = "console") -> dict:
+    def close(self) -> None:
+        """释放后台命令 worker；未走完的命令由下次启动恢复为部分失败。"""
+
+        self.commands.stop()
+
+    def startup(
+        self,
+        outdoor_c: float,
+        demand_pct: float = 60.0,
+        station: str = "console",
+        on_progress=None,
+    ) -> dict:
         """按调度链顺序把平台从冷态带到带负荷。"""
 
         with self._lock:
@@ -307,6 +321,7 @@ class Platform:
                 outdoor_c,
                 self.clock.now(),
                 demand_pct,
+                on_progress=on_progress,
             )
             summary = self._record_operation(op_id, "startup", report)
             self._operations += 1
@@ -438,7 +453,7 @@ class Platform:
             )
             return report
 
-    def secondary_cycle(self, dt: float = 1.0) -> dict:
+    def secondary_cycle(self, dt: float = 1.0, on_progress=None) -> dict:
         """跑一个二次网循环（结束前泵一定停稳）。"""
 
         with self._lock:
@@ -449,6 +464,7 @@ class Platform:
                 self.valves[sorted(self.valves)[0]],
                 self.durable,
                 dt,
+                on_progress=on_progress,
             )
             summary = self._record_operation(op_id, "secondary_cycle", report)
             self._operations += 1

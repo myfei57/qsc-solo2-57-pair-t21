@@ -59,12 +59,14 @@ def _cmd_serve(args: argparse.Namespace) -> int:
         except KeyboardInterrupt:  # pragma: no cover - 交互路径
             pass
         server.stop()
+        platform.close()
         return 0
     try:
         while True:
             time.sleep(1.0)
     except KeyboardInterrupt:  # pragma: no cover - 交互路径
         server.stop()
+        platform.close()
     return 0
 
 
@@ -104,7 +106,6 @@ def _cmd_demo(args: argparse.Namespace) -> int:
     base_url = server.start()
     probe = probe_endpoints(base_url, list(DEFAULT_PROBE_PATHS))
     server.stop()
-
     report = {
         "startup": startup,
         "weather": {key: weather[key] for key in ("ok", "outdoor_c", "supply_c", "epoch", "violations")},
@@ -146,7 +147,9 @@ def _cmd_demo(args: argparse.Namespace) -> int:
             failures.extend(f"{name}:{item}" for item in operation.get("violations", []))
     if failures:
         print(f"检查未通过: {failures}", file=sys.stderr)
+        platform.close()
         return 1
+    platform.close()
     return 0
 
 
